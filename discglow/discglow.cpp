@@ -238,6 +238,96 @@ namespace
 		return it != s_components.end() && still_valid(component, it->second.first, it->second.second);
 	}
 
+	// The instance still has a record (the game has not removed it)
+	bool instance_alive(uintptr_t component, uint64_t instance)
+	{
+		component_view view;
+		uint16_t slot;
+		float record[16];
+		bool valid = false;
+		return view.open(component) && instance < MAX_INSTANCES && view.read(static_cast<uint32_t>(instance), slot, record, valid) && valid;
+	}
+
+	// ---- Sending colours from DiscGlow's threads ----
+
+	// Off the game's main thread, SetInstanceModelColor does not colour at once: it appends the call (0x30 bytes) to the
+	// system's CDeferredMethodQueue (buffer at system + 0x338, its size at + 0x340, bytes used at + 0x358), and the game
+	// runs the queue on its main thread. The buffer has a fixed size and the game aborts ("CDeferredMethodQueue buffer is
+	// out of space") when it fills up: effects queueing colours for many discs 30 times a second while the game does not
+	// run the queue (loading into a public match) crashed the game. So a batch waits until the game has run the queue
+	// since the previous batch, and uses only a small part of the buffer.
+	constexpr uintptr_t QUEUE_SIZE = 0x340, QUEUE_USED = 0x358, QUEUE_IMMEDIATE = 0x368;
+	constexpr int64_t QUEUE_CALL_SIZE = 0x30;
+	constexpr size_t MAX_CALLS_PER_BATCH = 24;
+	std::map<uintptr_t, int64_t> s_queue_used_after; // System -> bytes used right after our last batch
+
+	struct colour_update
+	{
+		uintptr_t component;
+		uint64_t instance;
+		float rgba[4];
+	};
+
+	// Called with s_mutex held: how many colour calls may be queued on 'system' now
+	size_t queue_budget(uintptr_t system)
+	{
+		int64_t size = 0, used = 0;
+		int32_t immediate = 0;
+		if (!safe_read(system + QUEUE_SIZE, size) || !safe_read(system + QUEUE_USED, used) || !safe_read(system + QUEUE_IMMEDIATE, immediate))
+			return 0;
+		if (immediate != 0)
+			return MAX_CALLS_PER_BATCH; // Calls are applied at once, nothing is queued
+		if (size <= 0 || used < 0 || used > size)
+			return 0;
+		const auto it = s_queue_used_after.find(system);
+		if (it != s_queue_used_after.end() && used != 0 && used >= it->second)
+			return 0; // The game has not run the queue since our last batch
+		const int64_t room = size / 8 - used; // Leave most of the buffer to the game
+		return room > 0 ? (std::min)(static_cast<size_t>(room / QUEUE_CALL_SIZE), MAX_CALLS_PER_BATCH) : 0;
+	}
+
+	// Sends colours through the game as far as the queues allow; 'updates' keeps only the ones sent. Called without s_mutex.
+	void send_colours(std::vector<colour_update> &updates)
+	{
+		std::map<uintptr_t, size_t> budgets; // System -> calls left in this batch
+		std::set<uintptr_t> used_systems;
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			size_t kept = 0;
+			for (size_t i = 0; i < updates.size(); ++i)
+			{
+				const auto component = s_components.find(updates[i].component);
+				if (component == s_components.end() || !still_valid(updates[i].component, component->second.first, component->second.second))
+					continue;
+				const uintptr_t system = component->second.first;
+				auto budget = budgets.find(system);
+				if (budget == budgets.end())
+					budget = budgets.emplace(system, queue_budget(system)).first;
+				if (budget->second == 0)
+					continue;
+				--budget->second;
+				used_systems.insert(system);
+				updates[kept++] = updates[i];
+			}
+			updates.resize(kept);
+		}
+		for (const colour_update &update : updates)
+		{
+			float rgba[4];
+			std::memcpy(rgba, update.rgba, sizeof(rgba));
+			s_original(update.component, update.instance, rgba, 0);
+		}
+		if (used_systems.empty())
+			return;
+		const std::lock_guard<std::mutex> lock(s_mutex);
+		for (const uintptr_t system : used_systems)
+		{
+			int64_t used = 0;
+			if (safe_read(system + QUEUE_USED, used))
+				s_queue_used_after[system] = used;
+		}
+	}
+
 	// ---- Settings ----
 
 	std::wstring ini_path()
@@ -378,7 +468,7 @@ namespace
 	// Re-applies colours after the settings changed: repaints personal discs and discs holding a team colour
 	void reapply_colours()
 	{
-		std::vector<std::pair<std::pair<uintptr_t, uint64_t>, std::vector<float>>> updates;
+		std::vector<colour_update> updates;
 		{
 			const std::lock_guard<std::mutex> lock(s_mutex);
 			for (auto it = s_painted.begin(); it != s_painted.end();)
@@ -389,7 +479,11 @@ namespace
 					continue;
 				}
 				if (s_personal_disc)
-					updates.push_back({ *it, std::vector<float>(s_personal_colour, s_personal_colour + 4) });
+				{
+					colour_update update = { it->first, it->second };
+					std::memcpy(update.rgba, s_personal_colour, sizeof(update.rgba));
+					updates.push_back(update);
+				}
 				++it;
 			}
 			for (auto it = s_sticky_states.begin(); it != s_sticky_states.end();)
@@ -399,18 +493,17 @@ namespace
 					it = s_sticky_states.erase(it);
 					continue;
 				}
-				if (it->second.team >= 0)
+				if (it->second.team >= 0 && instance_alive(it->first.first, it->first.second))
 				{
-					float colour[4];
-					std::memcpy(colour, it->second.raw, sizeof(colour));
-					apply_rules(colour);
-					updates.push_back({ it->first, std::vector<float>(colour, colour + 4) });
+					colour_update update = { it->first.first, it->first.second };
+					std::memcpy(update.rgba, it->second.raw, sizeof(update.rgba));
+					apply_rules(update.rgba);
+					updates.push_back(update);
 				}
 				++it;
 			}
 		}
-		for (auto &update : updates)
-			s_original(update.first.first, update.first.second, update.second.data(), 0);
+		send_colours(updates); // Discs left out get the new colours from the game's next colour call
 	}
 
 	// ---- Effects ----
@@ -418,7 +511,8 @@ namespace
 	// Animates personal disc spheres and discs holding a team colour that have an effect, about 30 times a second
 	DWORD WINAPI effect_thread(void *)
 	{
-		std::vector<std::pair<std::pair<uintptr_t, uint64_t>, std::vector<float>>> updates;
+		std::vector<colour_update> updates;
+		std::map<std::pair<uintptr_t, uint64_t>, std::tuple<float, float, float>> last_sent; // Skips colours that did not change (strobe)
 		for (;;)
 		{
 			Sleep(33);
@@ -426,26 +520,36 @@ namespace
 			{
 				const std::lock_guard<std::mutex> lock(s_mutex);
 				const double t = now_seconds();
-				float colour[4];
+				const auto add = [&](const std::pair<uintptr_t, uint64_t> &key, const float *base, const effect &e)
+				{
+					if (!still_valid(key.first) || !instance_alive(key.first, key.second))
+						return;
+					colour_update update = { key.first, key.second };
+					float colour[4];
+					animate(base, e, t, colour);
+					const auto last = last_sent.find(key);
+					if (last != last_sent.end() && last->second == std::make_tuple(colour[0], colour[1], colour[2]))
+						return;
+					std::memcpy(update.rgba, colour, sizeof(update.rgba));
+					updates.push_back(update);
+				};
 				if (s_personal_disc && s_effects[0].mode != EFFECT_NONE)
 					for (const auto &painted : s_painted)
-						if (still_valid(painted.first))
-						{
-							animate(s_personal_colour, s_effects[0], t, colour);
-							updates.push_back({ painted, std::vector<float>(colour, colour + 4) });
-						}
+						add(painted, s_personal_colour, s_effects[0]);
 				for (const auto &entry : s_sticky_states)
 				{
 					const int team = entry.second.team;
-					if (team >= 0 && s_effects[1 + team].mode != EFFECT_NONE && still_valid(entry.first.first))
-					{
-						animate(s_team_colours[team], s_effects[1 + team], t, colour);
-						updates.push_back({ entry.first, std::vector<float>(colour, colour + 4) });
-					}
+					if (team >= 0 && s_effects[1 + team].mode != EFFECT_NONE)
+						add(entry.first, s_team_colours[team], s_effects[1 + team]);
 				}
 			}
-			for (auto &update : updates)
-				s_original(update.first.first, update.first.second, update.second.data(), 0);
+			if (updates.empty())
+				continue;
+			send_colours(updates);
+			for (const colour_update &update : updates)
+				last_sent[{ update.component, update.instance }] = std::make_tuple(update.rgba[0], update.rgba[1], update.rgba[2]);
+			if (last_sent.size() > 4096)
+				last_sent.clear();
 		}
 	}
 
@@ -490,6 +594,7 @@ namespace
 			}
 
 			std::map<std::pair<uintptr_t, uint16_t>, std::tuple<float, float, float>> positions;
+			std::vector<colour_update> paints;
 			for (const auto &target : targets)
 			{
 				const uintptr_t component = std::get<0>(target), system = std::get<1>(target), vtable = std::get<2>(target);
@@ -516,16 +621,22 @@ namespace
 						continue; // Only discs move; static white models of these types are left alone
 					if (!still_valid(component, system, vtable))
 						break;
-					float paint[4];
-					std::memcpy(paint, colour, sizeof(paint));
-					s_original(component, instance, paint, 0);
-					const std::lock_guard<std::mutex> lock(s_mutex);
-					s_painted.emplace(component, instance);
-					if (s_log)
-						log_line("personal disc: painted component %p slot %u (instance %u) at %.2f %.2f %.2f", reinterpret_cast<void *>(component), slot, instance, record[4], record[5], record[6]);
+					colour_update paint = { component, instance };
+					std::memcpy(paint.rgba, colour, sizeof(paint.rgba));
+					paints.push_back(paint);
 				}
 			}
 			last_positions = std::move(positions);
+			if (paints.empty())
+				continue;
+			send_colours(paints); // Discs left out are still white next time and painted then
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			for (const colour_update &paint : paints)
+			{
+				s_painted.emplace(paint.component, paint.instance);
+				if (s_log)
+					log_line("personal disc: painted component %p instance %llu", reinterpret_cast<void *>(paint.component), static_cast<unsigned long long>(paint.instance));
+			}
 		}
 	}
 
