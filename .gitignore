@@ -1,0 +1,8 @@
+# Build outputs
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+obj/
+*.zip
