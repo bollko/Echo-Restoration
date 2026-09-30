@@ -353,4 +353,53 @@ namespace DiscGlowSetup
 			TextRenderer.DrawText(g, Text, Theme.Body, new Rectangle(18, 0, Width - 18, Height), Theme.Text, TextFormatFlags.WordBreak);
 		}
 	}
+
+	// A row of options where one is selected (like a tab strip)
+	class Segmented : ThemedControl
+	{
+		public string[] Options = new string[0];
+		int _selected;
+		public event EventHandler SelectedChanged;
+		public Segmented() { Cursor = Cursors.Hand; }
+		public int Selected
+		{
+			get { return _selected; }
+			set
+			{
+				if (_selected == value) return;
+				_selected = value;
+				Invalidate();
+				if (SelectedChanged != null) SelectedChanged(this, EventArgs.Empty);
+			}
+		}
+		protected override void OnMouseDown(MouseEventArgs e)
+		{
+			if (Enabled && Options.Length > 0) Selected = Math.Max(0, Math.Min(Options.Length - 1, e.X * Options.Length / Width));
+			base.OnMouseDown(e);
+		}
+		protected override void OnPaint(PaintEventArgs e)
+		{
+			var g = e.Graphics;
+			g.SmoothingMode = SmoothingMode.AntiAlias;
+			g.Clear(Theme.Card);
+			using (var path = Theme.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 7))
+			using (var b = new SolidBrush(Theme.Back))
+			using (var p = new Pen(Theme.Border))
+			{
+				g.FillPath(b, path);
+				g.DrawPath(p, path);
+			}
+			float w = (Width - 4) / (float)Math.Max(1, Options.Length);
+			for (int i = 0; i < Options.Length; i++)
+			{
+				var r = new RectangleF(2 + i * w, 2, w, Height - 4);
+				if (i == _selected)
+					using (var path = Theme.Round(r, 5))
+					using (var b = new SolidBrush(Enabled ? Theme.Accent : Theme.Track))
+						g.FillPath(b, path);
+				Color text = !Enabled ? Theme.Disabled : i == _selected ? Color.FromArgb(28, 20, 14) : Theme.Muted;
+				TextRenderer.DrawText(g, Options[i], Theme.Small, Rectangle.Round(r), text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+			}
+		}
+	}
 }

@@ -9,7 +9,8 @@ Tools that bring back parts of Echo VR's older look on the final PC build.
 Custom colours for the disc's glowing grid sphere, and the orange personal disc from 2018.
 
 - **Personal disc:** gives your personal disc's sphere a colour again (2018 orange by default) instead of plain white.
-- **Team colours:** pick your own colours for the blue team's and orange team's disc.
+- **Team colours:** pick your own colours for the blue team's and orange team's disc, including the glow it casts on the arena.
+- **Effects:** rainbow, strobe or pulse for each disc, at a speed you choose.
 - **Sticky team colour:** the disc keeps its team colour until the other team touches it, instead of fading back to neutral. A new round still starts neutral.
 - **Live:** colour changes apply straight away, even while Echo is running.
 
@@ -26,6 +27,7 @@ If your `echovr.exe` is a different build, the installer tells you, and DiscGlow
 2. Run it. It finds Echo on its own; if not, click **Browse** and pick the `ready-at-dawn-echo-arena` folder.
 3. Click **Install / Update**, then **Launch Echo**.
 4. Pick your colours with the sliders (red, green, blue and saturation for each disc). Values above 1 glow brighter.
+5. Optionally pick an effect (Rainbow, Strobe or Pulse) and how many seconds one cycle takes.
 
 **Uninstall:** click **Uninstall** in the same app. Your colour settings are kept.
 
@@ -44,6 +46,8 @@ The app writes `DiscGlow.ini` next to `echovr.exe`. You can also edit it by hand
 | `BlueTeamColour` | `0 0.698 1` | The game's own blue |
 | `OrangeTeamColour` | `1 0.5 0.15` | The game's own orange |
 | `PersonalDiscSaturation`, `BlueTeamSaturation`, `OrangeTeamSaturation` | `1` | 0 grey, 1 unchanged, 2 extra vivid |
+| `PersonalDiscEffect`, `BlueTeamEffect`, `OrangeTeamEffect` | `none` | `none`, `rainbow`, `strobe` or `pulse` |
+| `PersonalDiscEffectSpeed`, `BlueTeamEffectSpeed`, `OrangeTeamEffectSpeed` | `2` | Seconds per effect cycle |
 | `StickyTeamColour` | `1` | Keep the team colour until the other team touches the disc |
 | `Log` | `0` | Write `DiscGlow.log` |
 
@@ -52,6 +56,8 @@ The app writes `DiscGlow.ini` next to `echovr.exe`. You can also edit it by hand
 Echo colours the disc sphere per team by setting a per-object colour through one engine function. DiscGlow hooks that function (with [MinHook](https://github.com/TsudaKageyu/minhook)) and:
 
 - swaps the game's blue and orange disc colours for the ones you chose, keeping the brightness of the game's fades and pulses;
+- does the same for the light the disc casts on its surroundings (a second hooked function);
+- animates discs that have an effect about 30 times a second;
 - replaces the fade back to neutral after a touch with the last team colour;
 - colours personal disc spheres, which the game never colours itself, by finding plain-white spheres that move in the groups of objects that hold discs.
 

@@ -22,6 +22,8 @@
  *   BlueTeamColour=0 0.698 1        colour for the blue team's disc (the game's own colour by default)
  *   OrangeTeamColour=1 0.5 0.15     colour for the orange team's disc (the game's own colour by default)
  *   PersonalDiscSaturation=1        also BlueTeamSaturation, OrangeTeamSaturation: 0 grey, 1 unchanged, 2 extra vivid
+ *   PersonalDiscEffect=none         also BlueTeamEffect, OrangeTeamEffect: none, rainbow, strobe or pulse
+ *   PersonalDiscEffectSpeed=2       seconds per effect cycle (also BlueTeamEffectSpeed, OrangeTeamEffectSpeed)
  *   StickyTeamColour=1              keep a disc's team colour until the other team touches it (no fade back to neutral)
  *   Replace1=r g b > r g b          up to Replace8: swap any other colour the game sets
  *   Log=0                           write DiscGlow.log
@@ -50,6 +52,10 @@ namespace
 	// FUN_140cc5900 in the goldmaster build: void SetInstanceModelColor(model component, instance, const float rgba[4], int)
 	constexpr uintptr_t SET_COLOR_RVA = 0xcc5900;
 	constexpr uint8_t SET_COLOR_BYTES[] = { 0x40, 0x53, 0x55, 0x56, 0x41, 0x54, 0x41, 0x56, 0x48, 0x83, 0xec, 0x30 };
+	// FUN_140bbe870: void SetLightColor(light component, index, const float rgb[3]); the disc's light on the surroundings
+	// is coloured through it by R15FrisbeeSetLightColorNode
+	constexpr uintptr_t SET_LIGHT_RVA = 0xbbe870;
+	constexpr uint8_t SET_LIGHT_BYTES[] = { 0x40, 0x53, 0x55, 0x56, 0x41, 0x54, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20 };
 
 	// Model component layout (from the function that applies a colour, FUN_1404c57b0):
 	//   *(component + 0x80)                  owning system; the component sits at a fixed offset inside it per component type
@@ -64,6 +70,8 @@ namespace
 
 	using set_color_fn = void(__fastcall *)(uintptr_t component, uint64_t instance, float *rgba, uint32_t extra);
 	set_color_fn s_original = nullptr;
+	using set_light_fn = void(__fastcall *)(uintptr_t component, uint64_t index, float *rgb);
+	set_light_fn s_original_light = nullptr;
 
 	uintptr_t s_base = 0;
 	wchar_t s_dir[MAX_PATH] = L"";
@@ -81,6 +89,15 @@ namespace
 		float from[3], to[3];
 	};
 	std::vector<replace_rule> s_rules;
+	// Colour effects per disc: 0 personal, 1 blue team, 2 orange team
+	enum effect_mode { EFFECT_NONE, EFFECT_RAINBOW, EFFECT_STROBE, EFFECT_PULSE };
+	struct effect
+	{
+		int mode = EFFECT_NONE;
+		float period = 2.0f; // Seconds per cycle
+	};
+	effect s_effects[3];
+	float s_team_colours[2][3] = {}; // The chosen team colours (after saturation), the base for effects
 
 	// Components the game has coloured: component -> (owning system, vtable) when first seen
 	std::map<uintptr_t, std::pair<uintptr_t, uintptr_t>> s_components;
@@ -97,6 +114,7 @@ namespace
 	};
 	std::map<std::pair<uintptr_t, uint64_t>, sticky_state> s_sticky_states;
 	std::set<std::tuple<uintptr_t, uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>> s_seen;
+	std::set<std::tuple<uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t>> s_seen_lights;
 
 	void log_line(const char *format, ...)
 	{
@@ -265,6 +283,7 @@ namespace
 			float before[3];
 			std::memcpy(before, rgb, sizeof(before));
 			saturate(rgb, saturation_keys[team]);
+			std::memcpy(s_team_colours[team], rgb, sizeof(rgb));
 			if (set || std::memcmp(before, rgb, sizeof(rgb)) != 0)
 			{
 				replace_rule rule;
@@ -282,6 +301,62 @@ namespace
 			if (swscanf_s(value, L"%f %f %f > %f %f %f", &rule.from[0], &rule.from[1], &rule.from[2], &rule.to[0], &rule.to[1], &rule.to[2]) == 6)
 				s_rules.push_back(rule);
 		}
+
+		// Effects: <Name>Effect=none|rainbow|strobe|pulse, <Name>EffectSpeed=seconds per cycle
+		const wchar_t *effect_names[3] = { L"PersonalDisc", L"BlueTeam", L"OrangeTeam" };
+		for (int i = 0; i < 3; ++i)
+		{
+			wchar_t key[64], value[64];
+			swprintf_s(key, L"%sEffect", effect_names[i]);
+			GetPrivateProfileStringW(L"DiscGlow", key, L"none", value, 64, path.c_str());
+			s_effects[i].mode = _wcsicmp(value, L"rainbow") == 0 ? EFFECT_RAINBOW : _wcsicmp(value, L"strobe") == 0 ? EFFECT_STROBE :
+				_wcsicmp(value, L"pulse") == 0 ? EFFECT_PULSE : EFFECT_NONE;
+			swprintf_s(key, L"%sEffectSpeed", effect_names[i]);
+			GetPrivateProfileStringW(L"DiscGlow", key, L"2", value, 64, path.c_str());
+			float period = 2;
+			s_effects[i].period = swscanf_s(value, L"%f", &period) == 1 ? (std::max)(0.05f, period) : 2.0f;
+		}
+	}
+
+	// The colour an effect gives at time 't' (seconds), based on 'base' (keeps its brightness)
+	void animate(const float *base, const effect &e, double t, float (&out)[4])
+	{
+		const double phase = std::fmod(t / e.period, 1.0);
+		const float peak = (std::max)(base[0], (std::max)(base[1], base[2]));
+		switch (e.mode)
+		{
+		case EFFECT_RAINBOW:
+		{
+			// Full-saturation hue wheel at the base colour's brightness
+			const float h = static_cast<float>(phase) * 6.0f, x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
+			const float wheel[6][3] = { { 1, x, 0 }, { x, 1, 0 }, { 0, 1, x }, { 0, x, 1 }, { x, 0, 1 }, { 1, 0, x } };
+			const float *c = wheel[(std::min)(5, static_cast<int>(h))];
+			const float value = (std::max)(0.5f, peak);
+			for (int i = 0; i < 3; ++i)
+				out[i] = c[i] * value;
+			break;
+		}
+		case EFFECT_STROBE:
+			for (int i = 0; i < 3; ++i)
+				out[i] = phase < 0.5 ? base[i] : base[i] * 0.03f;
+			break;
+		case EFFECT_PULSE:
+		{
+			const float k = 0.3f + 0.7f * (0.5f + 0.5f * static_cast<float>(std::cos(phase * 6.283185307)));
+			for (int i = 0; i < 3; ++i)
+				out[i] = base[i] * k;
+			break;
+		}
+		default:
+			std::memcpy(out, base, 3 * sizeof(float));
+			break;
+		}
+		out[3] = 1.0f;
+	}
+
+	double now_seconds()
+	{
+		return GetTickCount64() / 1000.0;
 	}
 
 	FILETIME ini_time()
@@ -327,6 +402,42 @@ namespace
 		}
 		for (auto &update : updates)
 			s_original(update.first.first, update.first.second, update.second.data(), 0);
+	}
+
+	// ---- Effects ----
+
+	// Animates personal disc spheres and discs holding a team colour that have an effect, about 30 times a second
+	DWORD WINAPI effect_thread(void *)
+	{
+		std::vector<std::pair<std::pair<uintptr_t, uint64_t>, std::vector<float>>> updates;
+		for (;;)
+		{
+			Sleep(33);
+			updates.clear();
+			{
+				const std::lock_guard<std::mutex> lock(s_mutex);
+				const double t = now_seconds();
+				float colour[4];
+				if (s_personal_disc && s_effects[0].mode != EFFECT_NONE)
+					for (const auto &painted : s_painted)
+						if (still_valid(painted.first))
+						{
+							animate(s_personal_colour, s_effects[0], t, colour);
+							updates.push_back({ painted, std::vector<float>(colour, colour + 4) });
+						}
+				for (const auto &entry : s_sticky_states)
+				{
+					const int team = entry.second.team;
+					if (team >= 0 && s_effects[1 + team].mode != EFFECT_NONE && still_valid(entry.first.first))
+					{
+						animate(s_team_colours[team], s_effects[1 + team], t, colour);
+						updates.push_back({ entry.first, std::vector<float>(colour, colour + 4) });
+					}
+				}
+			}
+			for (auto &update : updates)
+				s_original(update.first.first, update.first.second, update.second.data(), 0);
+		}
 	}
 
 	// ---- Personal discs ----
@@ -476,8 +587,8 @@ namespace
 				log_line("disc component found: %p (offset %#llx in its system)", reinterpret_cast<void *>(component), static_cast<unsigned long long>(component - system));
 
 			std::memcpy(out, rgba, sizeof(out));
-			bool keep = false;
-			if (s_sticky && s_disc_components.count(component) != 0)
+			bool keep = false, animated = false;
+			if (s_disc_components.count(component) != 0)
 			{
 				sticky_state &state = s_sticky_states[{ component, instance }];
 				const int team = team_of(rgba);
@@ -488,7 +599,7 @@ namespace
 					std::memcpy(state.raw, rgba, sizeof(state.raw));
 					state.last_was_team = true;
 				}
-				else if (state.team >= 0 && !(is_neutral(rgba) && state.last_was_team))
+				else if (s_sticky && state.team >= 0 && !(is_neutral(rgba) && state.last_was_team))
 				{
 					// Part of the fade back to neutral (or its end): keep the team colour instead.
 					// A direct jump from the team colour to neutral (new round) is let through.
@@ -501,8 +612,15 @@ namespace
 					state.team = -1;
 					state.last_was_team = false;
 				}
+				// A team with an effect: the effect thread owns the colour; send its current value so the game's call does not flicker
+				if (state.team >= 0 && s_effects[1 + state.team].mode != EFFECT_NONE)
+				{
+					animate(s_team_colours[state.team], s_effects[1 + state.team], now_seconds(), out);
+					animated = keep = true;
+				}
 			}
-			apply_rules(out);
+			if (!animated)
+				apply_rules(out);
 			changed = keep || std::memcmp(out, rgba, sizeof(out)) != 0;
 
 			if (s_log && s_debug)
@@ -515,6 +633,23 @@ namespace
 			}
 		}
 		s_original(component, instance, changed ? out : rgba, extra);
+	}
+
+	// The disc's light on its surroundings: team colours are swapped like the sphere's (same rules)
+	void __fastcall hooked_set_light(uintptr_t component, uint64_t index, float *rgb)
+	{
+		float out[4] = {};
+		bool changed = false;
+		if (rgb != nullptr)
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			if (s_log && s_seen_lights.emplace(component, index, bits(rgb[0]), bits(rgb[1]), bits(rgb[2])).second)
+				log_line("light: component %p index %llu colour %.4f %.4f %.4f", reinterpret_cast<void *>(component), static_cast<unsigned long long>(index), rgb[0], rgb[1], rgb[2]);
+			std::memcpy(out, rgb, 3 * sizeof(float));
+			apply_rules(out);
+			changed = std::memcmp(out, rgb, 3 * sizeof(float)) != 0;
+		}
+		s_original_light(component, index, changed ? out : rgb);
 	}
 
 	DWORD WINAPI install(void *)
@@ -545,7 +680,18 @@ namespace
 			log_line("DiscGlow active: personal disc %s, %zu colour swap(s), sticky %s, chained dinput8 %s.", s_personal_disc ? "on" : "off",
 				s_rules.size(), s_sticky ? "on" : "off", s_chain != nullptr ? "loaded" : "none");
 		}
+		// The disc light hook is optional: without it only the light keeps the game's colours
+		void *const light_target = reinterpret_cast<void *>(s_base + SET_LIGHT_RVA);
+		const bool light_hooked = std::memcmp(light_target, SET_LIGHT_BYTES, sizeof(SET_LIGHT_BYTES)) == 0 &&
+			MH_CreateHook(light_target, reinterpret_cast<void *>(&hooked_set_light), reinterpret_cast<void **>(&s_original_light)) == MH_OK &&
+			MH_EnableHook(light_target) == MH_OK;
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			log_line("Disc light hook %s.", light_hooked ? "active" : "not available");
+		}
 		if (HANDLE thread = CreateThread(nullptr, 0, personal_disc_thread, nullptr, 0, nullptr))
+			CloseHandle(thread);
+		if (HANDLE thread = CreateThread(nullptr, 0, effect_thread, nullptr, 0, nullptr))
 			CloseHandle(thread);
 		if (s_log && s_debug)
 			if (HANDLE thread = CreateThread(nullptr, 0, key_thread, nullptr, 0, nullptr))

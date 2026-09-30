@@ -81,7 +81,36 @@ namespace DiscGlowSetup
 		public string Key, Title, Subtitle;
 		public float[] Default;
 		public readonly Slider[] Sliders = new Slider[3];
-		public Slider Saturation;
+		public Slider Saturation, Speed;
+		public readonly Segmented Effect = new Segmented { Options = new[] { "None", "Rainbow", "Strobe", "Pulse" } };
+		public static readonly string[] EffectNames = { "none", "rainbow", "strobe", "pulse" };
+		public string EffectKey { get { return Key.Replace("Colour", "Effect"); } }
+		public string SpeedKey { get { return Key.Replace("Colour", "EffectSpeed"); } }
+
+		// The same effects as DiscGlow, for the preview: rainbow hue wheel, strobe on/off, pulse brightness
+		public float[] Animated(double t)
+		{
+			float[] b = Effective;
+			double period = Math.Max(0.05, (double)Speed.Value);
+			double phase = (t / period) % 1.0;
+			float peak = Math.Max(b[0], Math.Max(b[1], b[2]));
+			switch (Effect.Selected)
+			{
+				case 1:
+				{
+					float h = (float)phase * 6f, x = 1f - Math.Abs(h % 2f - 1f), v = Math.Max(0.5f, peak);
+					float[][] wheel = { new[] { 1f, x, 0f }, new[] { x, 1f, 0f }, new[] { 0f, 1f, x }, new[] { 0f, x, 1f }, new[] { x, 0f, 1f }, new[] { 1f, 0f, x } };
+					return wheel[Math.Min(5, (int)h)].Select(c => c * v).ToArray();
+				}
+				case 2: return phase < 0.5 ? b : b.Select(c => c * 0.03f).ToArray();
+				case 3:
+				{
+					float k = 0.3f + 0.7f * (0.5f + 0.5f * (float)Math.Cos(phase * 2 * Math.PI));
+					return b.Select(c => c * k).ToArray();
+				}
+				default: return b;
+			}
+		}
 		public readonly ColourSwatch Swatch = new ColourSwatch();
 		public ToggleSwitch Enable; // Only for colours that can be switched off
 
@@ -158,7 +187,7 @@ namespace DiscGlowSetup
 			FormBorderStyle = FormBorderStyle.FixedSingle;
 			MaximizeBox = false;
 			StartPosition = FormStartPosition.CenterScreen;
-			ClientSize = new Size(720, 758);
+			ClientSize = new Size(720, 856);
 			BackColor = Theme.Back;
 			ForeColor = Theme.Text;
 			Font = Theme.Body;
@@ -182,7 +211,7 @@ namespace DiscGlowSetup
 
 			// Colour card
 			colourCard.Title = "Disc colours";
-			colourCard.SetBounds(20, 286, 680, 454);
+			colourCard.SetBounds(20, 286, 680, 550);
 			colourCard.Controls.Add(new Label { Text = "Changes apply straight away, even while Echo is running. Values above 1 glow brighter.",
 				ForeColor = Theme.Muted, BackColor = Theme.Card, AutoSize = true, Left = 18, Top = 42 });
 
@@ -201,29 +230,46 @@ namespace DiscGlowSetup
 				{
 					var slider = new Slider { Text = c < 3 ? channel[c] : "Saturation", Minimum = 0, Maximum = 2, Step = 0.01m, Decimals = 2, FillColor = c < 3 ? fills[c] : Theme.Accent };
 					slider.SetBounds(x, top + 72 + c * 46, columnWidth, 40);
-					slider.ValueChanged += delegate { picker.Swatch.SetColour(picker.Effective); ColoursChanged(); };
+					slider.ValueChanged += delegate { if (picker.Saturation != null && picker.Effect.Selected == 0) picker.Swatch.SetColour(picker.Effective); ColoursChanged(); };
 					if (c < 3) picker.Sliders[c] = slider; else picker.Saturation = slider;
 					colourCard.Controls.Add(slider);
 				}
+				colourCard.Controls.Add(new Label { Text = "Effect", Font = Theme.Body, ForeColor = Theme.Muted, BackColor = Theme.Card, AutoSize = true, Left = x + 5, Top = top + 256 });
+				picker.Effect.SetBounds(x, top + 278, columnWidth, 28);
+				picker.Effect.SelectedChanged += delegate { picker.Speed.Enabled = picker.Effect.Selected != 0 && picker.Effect.Enabled; if (picker.Effect.Selected == 0) picker.Swatch.SetColour(picker.Effective); ColoursChanged(); };
+				colourCard.Controls.Add(picker.Effect);
+				picker.Speed = new Slider { Text = "Seconds per cycle", Minimum = 0.1m, Maximum = 10, Step = 0.1m, Decimals = 1, Value = 2, Enabled = false };
+				picker.Speed.SetBounds(x, top + 314, columnWidth, 40);
+				picker.Speed.ValueChanged += delegate { ColoursChanged(); };
+				colourCard.Controls.Add(picker.Speed);
 				var reset = new FlatButton { Text = i == 0 ? "Reset (2018 orange)" : "Reset (game colour)" };
-				reset.SetBounds(x, top + 262, columnWidth, 30);
-				reset.Click += delegate { picker.SetValue(picker.Default, 1f); };
+				reset.SetBounds(x, top + 364, columnWidth, 30);
+				reset.Click += delegate { picker.SetValue(picker.Default, 1f); picker.Effect.Selected = 0; picker.Speed.Value = 2; };
 				colourCard.Controls.Add(reset);
 			}
 
 			var personal = _pickers[0];
 			personal.Enable = new ToggleSwitch { Text = "Colour personal discs", Description = "Off leaves them the game's plain white" };
-			personal.Enable.SetBounds(18, top + 308, 320, 44);
-			personal.Enable.CheckedChanged += delegate { foreach (var s in personal.Sliders) s.Enabled = personal.Enable.Checked; personal.Saturation.Enabled = personal.Enable.Checked; ColoursChanged(); };
+			personal.Enable.SetBounds(18, top + 410, 320, 44);
+			personal.Enable.CheckedChanged += delegate { foreach (var s in personal.Sliders) s.Enabled = personal.Enable.Checked; personal.Saturation.Enabled = personal.Enable.Checked; personal.Effect.Enabled = personal.Enable.Checked; personal.Speed.Enabled = personal.Enable.Checked && personal.Effect.Selected != 0; ColoursChanged(); };
 			chkSticky.Text = "Keep the team colour";
 			chkSticky.Description = "Until the other team touches it";
-			chkSticky.SetBounds(350, top + 308, 312, 44);
+			chkSticky.SetBounds(350, top + 410, 312, 44);
 			chkSticky.CheckedChanged += delegate { ColoursChanged(); };
 			colourCard.Controls.AddRange(new Control[] { personal.Enable, chkSticky });
 
 			Controls.AddRange(new Control[] { lblTitle, lblSub, installCard, colourCard });
 
 			_saveTimer.Tick += delegate { _saveTimer.Stop(); SaveColours(); };
+			var preview = new Timer { Interval = 33 };
+			var clock = Stopwatch.StartNew();
+			preview.Tick += delegate
+			{
+				foreach (var picker in _pickers)
+					if (picker.Effect.Selected != 0 && picker.Saturation != null)
+						picker.Swatch.SetColour(picker.Animated(clock.Elapsed.TotalSeconds));
+			};
+			preview.Start();
 			Activated += delegate { if (!_saveTimer.Enabled) RefreshAll(); };
 			FormClosing += delegate { if (_saveTimer.Enabled) { _saveTimer.Stop(); SaveColours(); } };
 
@@ -406,6 +452,8 @@ namespace DiscGlowSetup
 				{
 					ini.SetDefault("DiscGlow", picker.Key, Format(picker.Default));
 					ini.SetDefault("DiscGlow", picker.SaturationKey, "1");
+					ini.SetDefault("DiscGlow", picker.EffectKey, "none");
+					ini.SetDefault("DiscGlow", picker.SpeedKey, "2");
 				}
 				ini.SetDefault("DiscGlow", "StickyTeamColour", "1");
 				ini.Save();
@@ -464,10 +512,18 @@ namespace DiscGlowSetup
 					float saturation;
 					if (!float.TryParse(ini.Get("DiscGlow", picker.SaturationKey), NumberStyles.Float, CultureInfo.InvariantCulture, out saturation)) saturation = 1f;
 					picker.SetValue(Parse(ini.Get("DiscGlow", picker.Key), picker.Default), saturation);
+					int effect = Array.IndexOf(ColourPicker.EffectNames, (ini.Get("DiscGlow", picker.EffectKey) ?? "none").ToLowerInvariant());
+					picker.Effect.Selected = Math.Max(0, effect);
+					float speed;
+					picker.Speed.Value = float.TryParse(ini.Get("DiscGlow", picker.SpeedKey), NumberStyles.Float, CultureInfo.InvariantCulture, out speed) ? (decimal)Math.Round(speed, 1) : 2m;
+					picker.Speed.Enabled = picker.Effect.Selected != 0;
+					if (picker.Effect.Selected == 0) picker.Swatch.SetColour(picker.Effective);
 				}
 				_pickers[0].Enable.Checked = ini.Get("DiscGlow", "PersonalDisc") != "0";
 				foreach (var s in _pickers[0].Sliders) s.Enabled = _pickers[0].Enable.Checked;
 				_pickers[0].Saturation.Enabled = _pickers[0].Enable.Checked;
+				_pickers[0].Effect.Enabled = _pickers[0].Enable.Checked;
+				_pickers[0].Speed.Enabled = _pickers[0].Enable.Checked && _pickers[0].Effect.Selected != 0;
 				chkSticky.Checked = ini.Get("DiscGlow", "StickyTeamColour") != "0";
 			}
 			finally { _loading = false; }
@@ -490,6 +546,8 @@ namespace DiscGlowSetup
 				{
 					ini.Set("DiscGlow", picker.Key, Format(picker.Value));
 					ini.Set("DiscGlow", picker.SaturationKey, picker.Saturation.Value.ToString("0.##", CultureInfo.InvariantCulture));
+					ini.Set("DiscGlow", picker.EffectKey, ColourPicker.EffectNames[picker.Effect.Selected]);
+					ini.Set("DiscGlow", picker.SpeedKey, picker.Speed.Value.ToString("0.#", CultureInfo.InvariantCulture));
 				}
 				ini.Set("DiscGlow", "PersonalDisc", _pickers[0].Enable.Checked ? "1" : "0");
 				ini.Set("DiscGlow", "StickyTeamColour", chkSticky.Checked ? "1" : "0");
