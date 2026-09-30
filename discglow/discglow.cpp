@@ -24,6 +24,7 @@
  *   PersonalDiscSaturation=1        also BlueTeamSaturation, OrangeTeamSaturation: 0 grey, 1 unchanged, 2 extra vivid
  *   PersonalDiscEffect=none         also BlueTeamEffect, OrangeTeamEffect: none, rainbow, strobe or pulse
  *   PersonalDiscEffectSpeed=2       seconds per effect cycle (also BlueTeamEffectSpeed, OrangeTeamEffectSpeed)
+ *   ChassisGlow=1                   0 turns the glow of player chassis off (their customisation tint colours become black)
  *   StickyTeamColour=1              keep a disc's team colour until the other team touches it (no fade back to neutral)
  *   Replace1=r g b > r g b          up to Replace8: swap any other colour the game sets
  *   Log=0                           write DiscGlow.log
@@ -72,6 +73,12 @@ namespace
 	set_color_fn s_original = nullptr;
 	using set_light_fn = void(__fastcall *)(uintptr_t component, uint64_t index, float *rgb);
 	set_light_fn s_original_light = nullptr;
+	// FUN_14091eb60: applies a customisation tint to a model instance: (component, instance, override on, colour A, colour B).
+	// Called by R15NetCustomization::OverrideTint with the equipped tint item's two colours; they colour the chassis glow.
+	constexpr uintptr_t SET_TINT_RVA = 0x91eb60;
+	constexpr uint8_t SET_TINT_BYTES[] = { 0x48, 0x8b, 0x81, 0xc8, 0x00, 0x00, 0x00, 0x41, 0xc1, 0xe0, 0x05, 0x44 };
+	using set_tint_fn = void(__fastcall *)(uintptr_t component, uint64_t instance, int enable, float *a, float *b);
+	set_tint_fn s_original_tint = nullptr;
 
 	uintptr_t s_base = 0;
 	wchar_t s_dir[MAX_PATH] = L"";
@@ -82,7 +89,7 @@ namespace
 	std::mutex s_mutex;
 
 	// Settings
-	bool s_log = false, s_debug = false, s_personal_disc = true, s_sticky = true;
+	bool s_log = false, s_debug = false, s_personal_disc = true, s_sticky = true, s_chassis_glow = true;
 	float s_personal_colour[4] = { 1.0f, 0.5f, 0.15f, 1.0f };
 	struct replace_rule
 	{
@@ -115,6 +122,7 @@ namespace
 	std::map<std::pair<uintptr_t, uint64_t>, sticky_state> s_sticky_states;
 	std::set<std::tuple<uintptr_t, uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>> s_seen;
 	std::set<std::tuple<uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t>> s_seen_lights;
+	std::set<std::tuple<uintptr_t, uint64_t, int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> s_seen_tints;
 
 	void log_line(const char *format, ...)
 	{
@@ -265,6 +273,7 @@ namespace
 		s_debug = GetPrivateProfileIntW(L"DiscGlow", L"Debug", 0, path.c_str()) != 0;
 		s_personal_disc = GetPrivateProfileIntW(L"DiscGlow", L"PersonalDisc", 1, path.c_str()) != 0;
 		s_sticky = GetPrivateProfileIntW(L"DiscGlow", L"StickyTeamColour", 1, path.c_str()) != 0;
+		s_chassis_glow = GetPrivateProfileIntW(L"DiscGlow", L"ChassisGlow", 1, path.c_str()) != 0;
 		float rgb[3];
 		if (read_rgb(L"PersonalDiscColour", rgb))
 		{
@@ -627,8 +636,8 @@ namespace
 			{
 				const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - s_base;
 				if (s_seen.emplace(caller, component, instance, bits(rgba[0]), bits(rgba[1]), bits(rgba[2]), bits(rgba[3])).second)
-					log_line("caller +%llx component %p instance %llu extra %u colour %.4f %.4f %.4f %.4f%s",
-						static_cast<unsigned long long>(caller), reinterpret_cast<void *>(component), static_cast<unsigned long long>(instance), extra,
+					log_line("caller +%llx component %p (group %#llx) instance %llu extra %u colour %.4f %.4f %.4f %.4f%s",
+						static_cast<unsigned long long>(caller), reinterpret_cast<void *>(component), static_cast<unsigned long long>(component - system), static_cast<unsigned long long>(instance), extra,
 						rgba[0], rgba[1], rgba[2], rgba[3], changed ? " (changed)" : "");
 			}
 		}
@@ -650,6 +659,31 @@ namespace
 			changed = std::memcmp(out, rgb, 3 * sizeof(float)) != 0;
 		}
 		s_original_light(component, index, changed ? out : rgb);
+	}
+
+	// Chassis customisation tint: with ChassisGlow=0 both tint colours become black (override forced on)
+	void __fastcall hooked_set_tint(uintptr_t component, uint64_t instance, int enable, float *a, float *b)
+	{
+		bool glow;
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			glow = s_chassis_glow;
+			if (s_log && a != nullptr && b != nullptr &&
+				s_seen_tints.emplace(component, instance & 0xffff, enable, bits(a[0]), bits(a[1]), bits(a[2]), bits(b[0]), bits(b[1]), bits(b[2])).second)
+			{
+				uintptr_t system = 0;
+				safe_read(component + 0x80, system);
+				log_line("tint: component %p (group %#llx) instance %llu override %d A %.4f %.4f %.4f B %.4f %.4f %.4f", reinterpret_cast<void *>(component),
+					static_cast<unsigned long long>(component - system), static_cast<unsigned long long>(instance & 0xffff), enable, a[0], a[1], a[2], b[0], b[1], b[2]);
+			}
+		}
+		if (!glow)
+		{
+			float black_a[3] = {}, black_b[3] = {};
+			s_original_tint(component, instance, 1, black_a, black_b);
+			return;
+		}
+		s_original_tint(component, instance, enable, a, b);
 	}
 
 	DWORD WINAPI install(void *)
@@ -685,9 +719,13 @@ namespace
 		const bool light_hooked = std::memcmp(light_target, SET_LIGHT_BYTES, sizeof(SET_LIGHT_BYTES)) == 0 &&
 			MH_CreateHook(light_target, reinterpret_cast<void *>(&hooked_set_light), reinterpret_cast<void **>(&s_original_light)) == MH_OK &&
 			MH_EnableHook(light_target) == MH_OK;
+		void *const tint_target = reinterpret_cast<void *>(s_base + SET_TINT_RVA);
+		const bool tint_hooked = std::memcmp(tint_target, SET_TINT_BYTES, sizeof(SET_TINT_BYTES)) == 0 &&
+			MH_CreateHook(tint_target, reinterpret_cast<void *>(&hooked_set_tint), reinterpret_cast<void **>(&s_original_tint)) == MH_OK &&
+			MH_EnableHook(tint_target) == MH_OK;
 		{
 			const std::lock_guard<std::mutex> lock(s_mutex);
-			log_line("Disc light hook %s.", light_hooked ? "active" : "not available");
+			log_line("Disc light hook %s, chassis tint hook %s.", light_hooked ? "active" : "not available", tint_hooked ? "active" : "not available");
 		}
 		if (HANDLE thread = CreateThread(nullptr, 0, personal_disc_thread, nullptr, 0, nullptr))
 			CloseHandle(thread);
@@ -700,6 +738,40 @@ namespace
 	}
 
 	HMODULE s_system_dinput8 = nullptr;
+
+	// Plugin loader: loads bin\win10\plugins\<file> for every {"file": "..."} entry in echoloader.json, the list
+	// EchoLoader uses, so plugins such as Echo Arcade work while dbgcore.dll is another patch (e.g. EchoRelay).
+	// If EchoLoader is present too, loading again only adds a reference. DiscGlow.ini: LoadPlugins=0 turns it off.
+	DWORD WINAPI load_plugins(void *)
+	{
+		const std::wstring dir(s_dir);
+		if (GetPrivateProfileIntW(L"DiscGlow", L"LoadPlugins", 1, (dir + L"\\DiscGlow.ini").c_str()) == 0)
+			return 0;
+		FILE *file = nullptr;
+		if (_wfopen_s(&file, (dir + L"\\echoloader.json").c_str(), L"rb") != 0 || file == nullptr)
+			return 0;
+		std::string json;
+		char buffer[4096];
+		for (size_t read; (read = std::fread(buffer, 1, sizeof(buffer), file)) > 0;)
+			json.append(buffer, read);
+		std::fclose(file);
+
+		for (size_t at = json.find("\"file\""); at != std::string::npos; at = json.find("\"file\"", at + 6))
+		{
+			const size_t open = json.find('"', json.find(':', at) + 1);
+			const size_t close = open == std::string::npos ? std::string::npos : json.find('"', open + 1);
+			if (close == std::string::npos)
+				break;
+			const std::string name = json.substr(open + 1, close - open - 1);
+			if (name.empty() || name.find_first_of("\\/:") != std::string::npos)
+				continue; // Only plain file names inside the plugins folder
+			const std::wstring path = dir + L"\\plugins\\" + std::wstring(name.begin(), name.end());
+			const HMODULE plugin = LoadLibraryW(path.c_str());
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			log_line("plugin %s: %s", name.c_str(), plugin != nullptr ? "loaded" : "could not be loaded");
+		}
+		return 0;
+	}
 }
 
 // Forwarded DirectInput entry point (the only export the game uses)
@@ -733,8 +805,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		const std::wstring chain = std::wstring(s_dir) + L"\\dinput8.chain.dll";
 		if (GetFileAttributesW(chain.c_str()) != INVALID_FILE_ATTRIBUTES)
 			s_chain = LoadLibraryW(chain.c_str());
+		if (s_chain == module) // DiscGlow itself (e.g. chained by another loader): forwarding to it would loop
+		{
+			FreeLibrary(s_chain);
+			s_chain = nullptr;
+		}
 		// Hooking from DllMain would run under the loader lock, so do it on a separate thread
 		if (HANDLE thread = CreateThread(nullptr, 0, install, nullptr, 0, nullptr))
+			CloseHandle(thread);
+		if (HANDLE thread = CreateThread(nullptr, 0, load_plugins, nullptr, 0, nullptr))
 			CloseHandle(thread);
 	}
 	return TRUE;
