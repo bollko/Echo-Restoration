@@ -562,7 +562,10 @@ namespace
 		float world_q[4], tracking_p[3], tracking_q[4];
 		if (tablet::panel_pose(fitted))
 		{
-			bridge::quat_from_axes(fitted.right, fitted.up, fitted.out, world_q);
+			// The compositor shows a quad's front along its -Z: turn it half round about up so the picture is not mirrored
+			const float left[3] = { -fitted.right[0], -fitted.right[1], -fitted.right[2] };
+			const float in[3] = { -fitted.out[0], -fitted.out[1], -fitted.out[2] };
+			bridge::quat_from_axes(left, fitted.up, in, world_q);
 			if (bridge::world_to_tracking(fitted.centre, world_q, tracking_p, tracking_q))
 			{
 				quad.QuadPoseCenter.Orientation = { tracking_q[0], tracking_q[1], tracking_q[2], tracking_q[3] };
