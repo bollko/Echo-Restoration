@@ -9,13 +9,21 @@
  *   +0x110 button instances (400 bytes each): +0x00 u16 row, +0x118 world position (x, y, z).
  * The tablet's buttons (actor 0x6c1f6ff04e070923) give its plane by a least-squares fit:
  *   world = top_left + x * right + y * down.
+ *
+ * Hiding the tablet from the camera only: each level's render scene (gamespace +0x60 -> +0x1c8) keeps a 256-bit visibility
+ * mask per viewport (+0x948, 0x20 each, count +0x950). Scene sets (+0xa8 -> +0xc88, 0x30 each, mask at +0x10) are found by
+ * name in two sorted tables (+0xa8 -> +0xc48 / count +0xc78, and +0xcc0 / +0xcf0). The engine's set-visibility messages use
+ * FUN_1404eb700 / FUN_1404e4bc0 (hide / show, first table) and FUN_1404f1b60 / FUN_1404f1930 (second table), each
+ * (gamespace, set, viewport bits). The tablet's set is its sub-level, r14_glb_global_mp. Viewport 1 is the camera's.
  */
 #include "tablet.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include "../discglow/include/MinHook.h"
 
@@ -26,6 +34,18 @@ namespace
 	constexpr size_t ROW_SIZE = 0x128, INSTANCE_SIZE = 400;
 
 	using update_fn = void(__fastcall *)(void *cs);
+	using set_visibility_fn = void(__fastcall *)(uintptr_t gamespace, unsigned set, unsigned viewports, uint64_t unused);
+	constexpr uintptr_t HIDE_SET_RVA[2] = { 0x4eb700, 0x4f1b60 }, SHOW_SET_RVA[2] = { 0x4e4bc0, 0x4f1930 };
+	constexpr uint8_t SET_VISIBILITY_BYTES[] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48 };
+	constexpr uint64_t TABLET_SET = 0x3f9915d3001dc28e; // sym("r14_glb_global_mp")
+	constexpr unsigned CAMERA_VIEWPORT = 1u << 1;
+	set_visibility_fn s_hide_set[2] = {}, s_show_set[2] = {};
+	std::atomic<bool> s_want_hidden{ false };
+	bool s_hidden = false;        // game thread
+	uintptr_t s_hidden_in = 0;    // the gamespace it was hidden in
+	unsigned s_hidden_set = 0;
+	int s_hidden_table = 0;
+	bool s_logged_sets = false;
 	update_fn s_original = nullptr;
 	void (*s_log)(const char *, ...) = nullptr;
 
@@ -202,10 +222,94 @@ namespace
 		}
 	}
 
+	// The tablet's scene set: (table 0 or 1, index), or false
+	bool find_tablet_set(uintptr_t gamespace, int &table, unsigned &index)
+	{
+		uintptr_t scene = 0, render = 0, level = 0;
+		if (!read(gamespace + 0x60, scene) || !read(scene + 0x1c8, render) || !read(render + 0xa8, level) || !level)
+			return false;
+		for (int t = 0; t < 2; ++t)
+		{
+			uintptr_t entries = 0;
+			uint64_t count = 0;
+			if (!read(level + (t ? 0xcc0 : 0xc48), entries) || !read(level + (t ? 0xcf0 : 0xc78), count) || !entries || count > 4096)
+				continue;
+			if (!s_logged_sets && s_log)
+			{
+				char line[1024] = "";
+				size_t used = 0;
+				for (uint64_t i = 0; i < count && used + 40 < sizeof(line); ++i)
+				{
+					uint64_t name = 0;
+					uint32_t at = 0;
+					if (read(entries + i * 16, name) && read(entries + i * 16 + 8, at))
+						used += snprintf(line + used, sizeof(line) - used, " %016llx=%u", static_cast<unsigned long long>(name), at);
+				}
+				s_log("tablet: scene set table %d (%llu):%s", t, static_cast<unsigned long long>(count), line);
+			}
+			for (uint64_t i = 0; i < count; ++i)
+			{
+				uint64_t name = 0;
+				uint32_t at = 0;
+				if (read(entries + i * 16, name) && name == TABLET_SET && read(entries + i * 16 + 8, at))
+				{
+					table = t;
+					index = at;
+					return true;
+				}
+			}
+		}
+		s_logged_sets = true;
+		return false;
+	}
+
+	// Game thread: hides or shows the tablet's scene set in the camera's viewport as asked
+	void update_visibility(uintptr_t cs)
+	{
+		const bool want = s_want_hidden;
+		if (want == s_hidden)
+			return;
+		if (!want)
+		{
+			if (s_hidden_in && s_show_set[s_hidden_table])
+				s_show_set[s_hidden_table](s_hidden_in, s_hidden_set, CAMERA_VIEWPORT, 0);
+			s_hidden = false;
+			s_hidden_in = 0;
+			if (s_log)
+				s_log("tablet: shown in the camera again");
+			return;
+		}
+		uintptr_t gamespace = 0;
+		int table = 0;
+		unsigned index = 0;
+		if (!read(cs + 0x80, gamespace) || !gamespace || !find_tablet_set(gamespace, table, index) || !s_hide_set[table])
+		{
+			s_hidden = true; // not found: do not search every frame (logged once)
+			if (s_log)
+				s_log("tablet: its scene set was not found; it stays visible in the camera");
+			return;
+		}
+		s_hide_set[table](gamespace, index, CAMERA_VIEWPORT, 0);
+		s_hidden = true;
+		s_hidden_in = gamespace;
+		s_hidden_set = index;
+		s_hidden_table = table;
+		if (s_log)
+			s_log("tablet: hidden from the camera (set table %d index %u)", table, index);
+	}
+
 	void __fastcall hooked_update(void *cs)
 	{
 		s_original(cs);
 		fit(reinterpret_cast<uintptr_t>(cs));
+		__try
+		{
+			update_visibility(reinterpret_cast<uintptr_t>(cs));
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			s_hidden = s_want_hidden;
+		}
 	}
 }
 
@@ -234,6 +338,11 @@ namespace tablet
 		s_nudge[1] = up;
 	}
 
+	void hide_in_camera(bool hide)
+	{
+		s_want_hidden = hide;
+	}
+
 	void set_scale(float scale)
 	{
 		const std::lock_guard<std::mutex> lock(s_mutex);
@@ -243,6 +352,13 @@ namespace tablet
 	bool start(unsigned char *exe, void (*log)(const char *format, ...))
 	{
 		s_log = log;
+		for (int t = 0; t < 2; ++t)
+			if (std::memcmp(exe + HIDE_SET_RVA[t], SET_VISIBILITY_BYTES, sizeof(SET_VISIBILITY_BYTES)) == 0 &&
+				std::memcmp(exe + SHOW_SET_RVA[t], SET_VISIBILITY_BYTES, sizeof(SET_VISIBILITY_BYTES)) == 0)
+			{
+				s_hide_set[t] = reinterpret_cast<set_visibility_fn>(exe + HIDE_SET_RVA[t]);
+				s_show_set[t] = reinterpret_cast<set_visibility_fn>(exe + SHOW_SET_RVA[t]);
+			}
 		// Same prologue check as Echo Arcade's runtime: if it already hooked the function, chain onto its jump
 		void *target = exe + BUTTON_UPDATE_RVA;
 		const bool ok = MH_CreateHook(target, reinterpret_cast<void *>(&hooked_update), reinterpret_cast<void **>(&s_original)) == MH_OK &&
