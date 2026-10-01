@@ -454,8 +454,8 @@ namespace
 		float right[3], back[3];
 		for (int c = 0; c < 3; ++c)
 		{
-			right[c] = selfie ? -p.right[c] : p.right[c];
-			back[c] = selfie ? -p.out[c] : p.out[c];
+			right[c] = selfie ? p.right[c] : -p.right[c]; // tested in the headset: selfie looks along the panel's facing
+			back[c] = selfie ? p.out[c] : -p.out[c];
 		}
 		bridge::quat_from_axes(right, p.up, back, rotation);
 		return true;
