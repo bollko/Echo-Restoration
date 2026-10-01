@@ -21,9 +21,6 @@
  *   OnPanel=1             hand mode, with the side panel's hand: the camera is the panel's, like a phone's (HandYaw 0 looks
  *                         out of the back of the panel, 180 is the selfie camera; HandOffset z = reach in metres)
  *   Freeze=0              1 keeps the camera where it was when frozen (a tripod), until 0
- *   HideTablet=1          leaves the tablet out of the camera's picture while the camera is in use: the camera does not
- *                         draw anything closer than ClipDistance metres (its near plane; the game's is 0.05)
- *   ClipDistance=0.35
  *   Smoothing=0           0 (off) .. 1: the camera eases towards where it should be, like a gimbal (up to ~0.6 s lag)
  *   Distance=2            metres behind the head (third_person)
  *   Height=0.4            metres above the head (third_person)
@@ -93,15 +90,6 @@ namespace
 	alignas(16) float s_hand_turn[4] = { 0, 0, 0, 1 }; // From HandYaw and HandPitch
 	bool s_logged_first = false, s_log_poses = false, s_freeze = false, s_on_panel = true;
 	float s_smoothing = 0;
-	bool s_hide_tablet = true;
-	float s_clip_distance = 0.35f;
-	// FUN_140509480(game): called at the end of the camera update; the view is used from there, so the camera's near plane
-	// (camera +0x9c, set to 0.05 just before) is raised at its start
-	constexpr uintptr_t SUBMIT_RVA = 0x509480, CAMERA_NEAR = 0x9c;
-	constexpr uint8_t SUBMIT_BYTES[] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x55, 0x48, 0x81, 0xec, 0x20, 0x01, 0x00, 0x00 };
-	using submit_fn = void(__fastcall *)(uintptr_t game);
-	submit_fn s_original_submit = nullptr;
-	thread_local bool t_in_camera_update = false;
 	// Smoothed pose (camera thread only)
 	float s_smooth_pose[8];
 	bool s_have_smooth = false;
@@ -152,19 +140,6 @@ namespace
 		}
 	}
 
-	bool safe_write(uintptr_t address, float value)
-	{
-		__try
-		{
-			*reinterpret_cast<float *>(address) = value;
-			return true;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			return false;
-		}
-	}
-
 	template <typename T>
 	bool safe_read(uintptr_t address, T &value)
 	{
@@ -206,8 +181,6 @@ namespace
 		s_height = ini_float(L"Height", 0.4f);
 		s_freeze = GetPrivateProfileIntW(L"EchoCam", L"Freeze", 0, ini_path().c_str()) != 0;
 		s_smoothing = (std::max)(0.0f, (std::min)(ini_float(L"Smoothing", 0), 1.0f));
-		s_hide_tablet = GetPrivateProfileIntW(L"EchoCam", L"HideTablet", 1, ini_path().c_str()) != 0;
-		s_clip_distance = (std::max)(0.05f, (std::min)(ini_float(L"ClipDistance", 0.35f), 2.0f));
 		s_on_panel = GetPrivateProfileIntW(L"EchoCam", L"OnPanel", 1, ini_path().c_str()) != 0;
 	}
 
@@ -465,33 +438,8 @@ namespace
 	{
 		uint64_t flags = 0;
 		t_placing_camera = safe_read(game + GAME_FLAGS, flags) && ((flags >> 29) & 1) != 0;
-		t_in_camera_update = t_placing_camera;
 		s_original(game);
-		t_placing_camera = t_in_camera_update = false;
-	}
-
-	void __fastcall hooked_submit(uintptr_t game)
-	{
-		if (t_in_camera_update)
-		{
-			bool hide;
-			int mode;
-			float clip;
-			{
-				const std::lock_guard<std::mutex> lock(s_mutex);
-				hide = s_hide_tablet;
-				mode = s_mode;
-				clip = s_clip_distance;
-			}
-			uintptr_t renderer = 0, camera = 0;
-			float near_plane = 0;
-			if (hide && mode != MODE_HEAD && safe_read(s_base + RENDERER_RVA, renderer) && safe_read(renderer + CAPTURE_CAMERA, camera) && camera &&
-				safe_read(camera + CAMERA_NEAR, near_plane) && near_plane < clip)
-			{
-				safe_write(camera + CAMERA_NEAR, clip);
-			}
-		}
-		s_original_submit(game);
+		t_placing_camera = false;
 	}
 
 	DWORD WINAPI key_thread(void *)
@@ -558,13 +506,6 @@ namespace
 		}
 		log_line("EchoCam active (mode %s). Start Echo with -capturevp2; F10 logs the head and hand poses.",
 			s_mode == MODE_HEAD ? "head" : s_mode == MODE_HAND ? "hand" : "third_person");
-		void *const submit = reinterpret_cast<void *>(s_base + SUBMIT_RVA);
-		if (std::memcmp(submit, SUBMIT_BYTES, sizeof(SUBMIT_BYTES)) == 0 &&
-			MH_CreateHook(submit, reinterpret_cast<void *>(&hooked_submit), reinterpret_cast<void **>(&s_original_submit)) == MH_OK &&
-			MH_EnableHook(submit) == MH_OK)
-			log_line("Near-plane hook active (HideTablet).");
-		else
-			log_line("Near-plane hook not available.");
 		tablet::start(reinterpret_cast<unsigned char *>(s_base), locked_log);
 		panel::start(ini_path(), locked_log);
 		if (HANDLE thread = CreateThread(nullptr, 0, key_thread, nullptr, 0, nullptr))

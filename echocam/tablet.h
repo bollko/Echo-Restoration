@@ -14,6 +14,5 @@ namespace tablet
 	void set_head(const float *world_position); // the player's head (camera thread): the panel faces it
 	void set_scale(float scale);                // panel size multiplier (EchoCam.ini [Panel] Scale)
 	void set_nudge(float right, float up);      // metres along the tablet's edges (EchoCam.ini [Panel] Nudge)
-	void hide_in_camera(bool hide);             // hides the tablet's scene set in the camera's viewport only (applied on the game thread)
 	bool start(unsigned char *exe, void (*log)(const char *format, ...)); // after MH_Initialize
 }
