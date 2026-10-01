@@ -33,7 +33,7 @@ namespace
 	tablet::PanelPose s_pose{};
 	ULONGLONG s_pose_time = 0;
 	bool s_logged = false;
-	float s_head[3] = {}, s_scale = 1.3f, s_nudge[2] = { 0.02f, 0.03f };
+	float s_head[3] = {}, s_scale = 1.3f, s_nudge[2] = { 0.0175f, 0.0125f };
 	bool s_have_head = false;
 
 	template <typename T>
