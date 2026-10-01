@@ -21,6 +21,7 @@
  *   OnPanel=1             hand mode, with the side panel's hand: the camera is the panel's, like a phone's (HandYaw 0 looks
  *                         out of the back of the panel, 180 is the selfie camera; HandOffset z = reach in metres)
  *   Freeze=0              1 keeps the camera where it was when frozen (a tripod), until 0
+ *   Fov=0                 camera field of view in degrees (0 = the game's capturefov); the CAMERA tile's fisheye widens it
  *   Smoothing=0           0 (off) .. 1: the camera eases towards where it should be, like a gimbal (up to ~0.6 s lag)
  *   Distance=2            metres behind the head (third_person)
  *   Height=0.4            metres above the head (third_person)
@@ -90,6 +91,10 @@ namespace
 	alignas(16) float s_hand_turn[4] = { 0, 0, 0, 1 }; // From HandYaw and HandPitch
 	bool s_logged_first = false, s_log_poses = false, s_freeze = false, s_on_panel = true;
 	float s_smoothing = 0;
+	float s_fov = 0;                  // degrees, 0 = the game's
+	constexpr uintptr_t CAPTURE_FOV = 0x8e2c; // game: the active graphics settings' capturefov (degrees), read by the update
+	float s_game_fov = 0;             // camera thread: the game's own value, kept while overridden
+	bool s_fov_overridden = false;
 	// Smoothed pose (camera thread only)
 	float s_smooth_pose[8];
 	bool s_have_smooth = false;
@@ -181,6 +186,7 @@ namespace
 		s_height = ini_float(L"Height", 0.4f);
 		s_freeze = GetPrivateProfileIntW(L"EchoCam", L"Freeze", 0, ini_path().c_str()) != 0;
 		s_smoothing = (std::max)(0.0f, (std::min)(ini_float(L"Smoothing", 0), 1.0f));
+		s_fov = (std::max)(0.0f, (std::min)(ini_float(L"Fov", 0), 170.0f));
 		s_on_panel = GetPrivateProfileIntW(L"EchoCam", L"OnPanel", 1, ini_path().c_str()) != 0;
 	}
 
@@ -434,10 +440,55 @@ namespace
 		return true;
 	}
 
+	bool safe_write_float(uintptr_t address, float value)
+	{
+		__try
+		{
+			*reinterpret_cast<float *>(address) = value;
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	// The camera's field of view: the setting (fisheye) while the camera is in use, else the game's own value back
+	void apply_fov(uintptr_t game)
+	{
+		float fov;
+		int mode;
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			fov = s_fov;
+			mode = s_mode;
+		}
+		const bool want = fov > 0 && mode != MODE_HEAD;
+		if (want)
+		{
+			if (!s_fov_overridden)
+			{
+				if (!safe_read(game + CAPTURE_FOV, s_game_fov))
+					return;
+				s_fov_overridden = true;
+				const std::lock_guard<std::mutex> lock(s_mutex);
+				log_line("camera FOV %.0f (the game's is %.0f)", fov, s_game_fov);
+			}
+			safe_write_float(game + CAPTURE_FOV, fov);
+		}
+		else if (s_fov_overridden)
+		{
+			safe_write_float(game + CAPTURE_FOV, s_game_fov);
+			s_fov_overridden = false;
+		}
+	}
+
 	void __fastcall hooked_update_camera(uintptr_t game)
 	{
 		uint64_t flags = 0;
 		t_placing_camera = safe_read(game + GAME_FLAGS, flags) && ((flags >> 29) & 1) != 0;
+		if (t_placing_camera)
+			apply_fov(game);
 		s_original(game);
 		t_placing_camera = false;
 	}
