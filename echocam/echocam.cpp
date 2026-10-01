@@ -21,6 +21,7 @@
  *   OnPanel=1             hand mode, with the side panel's hand: the camera is the panel's, like a phone's (HandYaw 0 looks
  *                         out of the back of the panel, 180 is the selfie camera; HandOffset z = reach in metres)
  *   Freeze=0              1 keeps the camera where it was when frozen (a tripod), until 0
+ *   Smoothing=0           0 (off) .. 1: the camera eases towards where it should be, like a gimbal (up to ~0.6 s lag)
  *   Distance=2            metres behind the head (third_person)
  *   Height=0.4            metres above the head (third_person)
  *   Log=1                 write EchoCam.log
@@ -88,6 +89,11 @@ namespace
 	float s_hand_offset[3] = {};
 	alignas(16) float s_hand_turn[4] = { 0, 0, 0, 1 }; // From HandYaw and HandPitch
 	bool s_logged_first = false, s_log_poses = false, s_freeze = false, s_on_panel = true;
+	float s_smoothing = 0;
+	// Smoothed pose (camera thread only)
+	float s_smooth_pose[8];
+	bool s_have_smooth = false;
+	LARGE_INTEGER s_smooth_time{};
 	// The pose kept while frozen (camera thread only)
 	alignas(16) float s_frozen_pose[8];
 	bool s_have_frozen = false;
@@ -174,6 +180,7 @@ namespace
 		s_distance = ini_float(L"Distance", 2.0f);
 		s_height = ini_float(L"Height", 0.4f);
 		s_freeze = GetPrivateProfileIntW(L"EchoCam", L"Freeze", 0, ini_path().c_str()) != 0;
+		s_smoothing = (std::max)(0.0f, (std::min)(ini_float(L"Smoothing", 0), 1.0f));
 		s_on_panel = GetPrivateProfileIntW(L"EchoCam", L"OnPanel", 1, ini_path().c_str()) != 0;
 	}
 
@@ -255,6 +262,41 @@ namespace
 
 	bool tablet_camera(const float *turn, float reach, float *position, float *rotation);
 
+	// Eases 'pose' (rotation, position) towards its target over time: amount 0 = off, 1 = a time constant of ~0.6 s.
+	// Big jumps (a new mode, a respawn) are taken at once.
+	void smooth(float *pose, float amount)
+	{
+		LARGE_INTEGER now, frequency;
+		QueryPerformanceCounter(&now);
+		QueryPerformanceFrequency(&frequency);
+		const float dt = s_have_smooth ? float(now.QuadPart - s_smooth_time.QuadPart) / float(frequency.QuadPart) : 0;
+		s_smooth_time = now;
+		const float jump = std::sqrt((pose[4] - s_smooth_pose[4]) * (pose[4] - s_smooth_pose[4]) + (pose[5] - s_smooth_pose[5]) * (pose[5] - s_smooth_pose[5]) +
+			(pose[6] - s_smooth_pose[6]) * (pose[6] - s_smooth_pose[6]));
+		if (amount <= 0 || !s_have_smooth || dt <= 0 || dt > 0.5f || jump > 2.0f)
+		{
+			std::memcpy(s_smooth_pose, pose, sizeof(s_smooth_pose));
+			s_have_smooth = true;
+			return;
+		}
+		const float k = 1 - std::exp(-dt / (amount * 0.6f));
+		for (int c = 4; c < 7; ++c)
+			s_smooth_pose[c] += (pose[c] - s_smooth_pose[c]) * k;
+		// Rotation: normalised lerp on the same hemisphere
+		const float d = s_smooth_pose[0] * pose[0] + s_smooth_pose[1] * pose[1] + s_smooth_pose[2] * pose[2] + s_smooth_pose[3] * pose[3];
+		const float sign = d < 0 ? -1.0f : 1.0f;
+		float length = 0;
+		for (int c = 0; c < 4; ++c)
+		{
+			s_smooth_pose[c] += (pose[c] * sign - s_smooth_pose[c]) * k;
+			length += s_smooth_pose[c] * s_smooth_pose[c];
+		}
+		length = std::sqrt(length);
+		for (int c = 0; c < 4; ++c)
+			s_smooth_pose[c] /= length;
+		std::memcpy(pose, s_smooth_pose, 7 * sizeof(float));
+	}
+
 	// Replaces 'pose' (the head: rotation, then position) with the camera pose for the current mode
 	void camera_pose(uintptr_t node, float *pose)
 	{
@@ -262,6 +304,7 @@ namespace
 		float distance, height, hand_offset[3];
 		alignas(16) float hand_turn[4];
 		bool log_poses, freeze, on_panel;
+		float smoothing;
 		{
 			const std::lock_guard<std::mutex> lock(s_mutex);
 			mode = s_mode;
@@ -274,6 +317,7 @@ namespace
 			s_log_poses = false;
 			freeze = s_freeze;
 			on_panel = s_on_panel;
+			smoothing = s_smoothing;
 		}
 
 		alignas(16) float head[8];
@@ -333,6 +377,7 @@ namespace
 		}
 		std::memcpy(pose, rotation, sizeof(rotation));
 		std::memcpy(pose + 4, position, sizeof(position));
+		smooth(pose, smoothing);
 		if (freeze)
 		{
 			std::memcpy(s_frozen_pose, pose, sizeof(s_frozen_pose));
