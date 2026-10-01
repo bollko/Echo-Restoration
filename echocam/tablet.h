@@ -1,0 +1,15 @@
+// Where the social tablet really is (tablet.cpp): fitted every frame from the world positions of its touch buttons.
+#pragma once
+
+namespace tablet
+{
+	// In game world space: the side panel's centre, its axes (right, up, out towards the viewer) and size in metres,
+	// flush with the tablet's right edge. False when the tablet has not been seen for a moment.
+	struct PanelPose
+	{
+		float centre[3], right[3], up[3], out[3];
+		float width, height;
+	};
+	bool panel_pose(PanelPose &pose);
+	bool start(unsigned char *exe, void (*log)(const char *format, ...)); // after MH_Initialize
+}

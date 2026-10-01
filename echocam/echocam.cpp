@@ -39,6 +39,8 @@
 #include <string>
 #include "../discglow/include/MinHook.h"
 #include "panel.h"
+#include "tablet.h"
+#include "bridge.h"
 
 namespace
 {
@@ -58,6 +60,7 @@ namespace
 	// FUN_14072c780 / FUN_14072df40 (out position, 1) for the left / right controller
 	constexpr uintptr_t TRACKING_SESSION_RVA = 0x20c77a0, HAND_READY_RVA = 0x20223cc;
 	constexpr uintptr_t HAND_ROTATION_RVA[2] = { 0x72c6d0, 0x72de90 }, HAND_POSITION_RVA[2] = { 0x72c780, 0x72df40 };
+	constexpr uintptr_t PLAY_SPACE_ROTATION_RVA = 0x20223f8, HEAD_OFFSET_RVA = 0x20c7790; // see FUN_14072cd50
 	constexpr uint8_t HAND_GETTER_BYTES[] = { 0x40, 0x53, 0x48, 0x83, 0xec, 0x30, 0x48, 0x83, 0x3d };
 	// FUN_1400f93b0(out, vector, quaternion): rotates; FUN_1400f94e0(out, a, b): quaternion product a * b
 	constexpr uintptr_t ROTATE_RVA = 0xf93b0, MULTIPLY_RVA = 0xf94e0;
@@ -250,6 +253,8 @@ namespace
 	thread_local bool t_placing_camera = false;
 	get_transform_fn s_original_get_transform = nullptr;
 
+	bool tablet_camera(const float *turn, float reach, float *position, float *rotation);
+
 	// Replaces 'pose' (the head: rotation, then position) with the camera pose for the current mode
 	void camera_pose(uintptr_t node, float *pose)
 	{
@@ -300,7 +305,9 @@ namespace
 		int panel_hand;
 		float unused_offset[3], unused_rotation[4], unused_width;
 		panel::layout(panel_hand, unused_offset, unused_rotation, unused_width);
-		if (mode == MODE_HAND && on_panel && hand == panel_hand)
+		if (mode == MODE_HAND && on_panel && hand == panel_hand && tablet_camera(hand_turn, hand_offset[2], position, rotation))
+			;
+		else if (mode == MODE_HAND && on_panel && hand == panel_hand)
 			panel_camera(hands[hand], hand_turn, hand_offset[2], position, rotation);
 		else if (mode == MODE_HAND)
 		{
@@ -354,6 +361,33 @@ namespace
 
 	// The game sets the camera from the head and submits the view in the same call, so moving the camera afterwards would
 	// never be drawn: the head transform it reads is swapped instead (hooked_get_transform).
+	void conj_rotate(const float *q, const float *v, float *out)
+	{
+		const float c[4] = { -q[0], -q[1], -q[2], q[3] };
+		rotate(c, v, out);
+	}
+
+	// The tablet's side panel as a phone camera (game world): selfie looks out of the panel at you, front out of its back
+	bool tablet_camera(const float *turn, float reach, float *position, float *rotation)
+	{
+		tablet::PanelPose p;
+		if (!tablet::panel_pose(p))
+			return false;
+		const bool selfie = std::fabs(turn[1]) > 0.5f; // HandYaw 180
+		const float away = (std::max)(0.0f, reach - 0.25f);
+		for (int c = 0; c < 3; ++c)
+			position[c] = p.centre[c] + p.up[c] * (p.height / 2 - 0.02f) - p.out[c] * away;
+		// The camera looks along its local -Z
+		float right[3], back[3];
+		for (int c = 0; c < 3; ++c)
+		{
+			right[c] = selfie ? -p.right[c] : p.right[c];
+			back[c] = selfie ? -p.out[c] : p.out[c];
+		}
+		bridge::quat_from_axes(right, p.up, back, rotation);
+		return true;
+	}
+
 	void __fastcall hooked_update_camera(uintptr_t game)
 	{
 		uint64_t flags = 0;
@@ -426,10 +460,45 @@ namespace
 		}
 		log_line("EchoCam active (mode %s). Start Echo with -capturevp2; F10 logs the head and hand poses.",
 			s_mode == MODE_HEAD ? "head" : s_mode == MODE_HAND ? "hand" : "third_person");
+		tablet::start(reinterpret_cast<unsigned char *>(s_base), locked_log);
 		panel::start(ini_path(), locked_log);
 		if (HANDLE thread = CreateThread(nullptr, 0, key_thread, nullptr, 0, nullptr))
 			CloseHandle(thread);
 		return 0;
+	}
+}
+
+namespace bridge
+{
+	bool world_to_tracking(const float *world_position, const float *world_rotation, float *position, float *rotation)
+	{
+		uintptr_t renderer = 0, node = 0, set = 0, array = 0;
+		uint16_t index = 0;
+		float node_pose[8], space[4], offset[3];
+		if (!safe_read(s_base + RENDERER_RVA, renderer) || !safe_read(renderer + HEAD_NODE, node) || !node || !safe_read(node + NODE_SET, set) ||
+			!safe_read(set + NODE_ARRAY, array) || !safe_read(node + NODE_INDEX, index) ||
+			!safe_copy(node_pose, reinterpret_cast<const void *>(array + index * NODE_SIZE), sizeof(node_pose)) ||
+			!safe_copy(space, reinterpret_cast<const void *>(s_base + PLAY_SPACE_ROTATION_RVA), sizeof(space)) ||
+			!safe_copy(offset, reinterpret_cast<const void *>(s_base + HEAD_OFFSET_RVA), sizeof(offset)))
+			return false;
+		// world = node.p + node.q * (space * (flip(tracking) + offset)); flip turns x and z round
+		const float relative[3] = { world_position[0] - node_pose[4], world_position[1] - node_pose[5], world_position[2] - node_pose[6] };
+		float local[3], flipped[3];
+		conj_rotate(node_pose, relative, local);
+		conj_rotate(space, local, flipped);
+		position[0] = -(flipped[0] - offset[0]);
+		position[1] = flipped[1] - offset[1];
+		position[2] = -(flipped[2] - offset[2]);
+		const float node_inverse[4] = { -node_pose[0], -node_pose[1], -node_pose[2], node_pose[3] };
+		const float space_inverse[4] = { -space[0], -space[1], -space[2], space[3] };
+		float q[4];
+		quat_multiply(space_inverse, node_inverse, q);
+		quat_multiply(q, world_rotation, q);
+		rotation[0] = -q[0];
+		rotation[1] = q[1];
+		rotation[2] = -q[2];
+		rotation[3] = q[3];
+		return true;
 	}
 }
 

@@ -29,6 +29,8 @@
  */
 #include "panel.h"
 #include "panel_ipc.h"
+#include "tablet.h"
+#include "bridge.h"
 #include <Windows.h>
 #include <d3d12.h>
 #include <cmath>
@@ -550,6 +552,19 @@ namespace
 		quad.QuadPoseCenter.Orientation = multiply(hand_pose.Orientation, held_rotation(rotation));
 		quad.QuadPoseCenter.Position = { hand_pose.Position.x + moved.x, hand_pose.Position.y + moved.y, hand_pose.Position.z + moved.z };
 		quad.QuadSize = { width, width * HEIGHT / WIDTH };
+		// Flush with the tablet itself when its buttons can be seen (tablet.cpp), else held as configured above
+		tablet::PanelPose fitted;
+		float world_q[4], tracking_p[3], tracking_q[4];
+		if (tablet::panel_pose(fitted))
+		{
+			bridge::quat_from_axes(fitted.right, fitted.up, fitted.out, world_q);
+			if (bridge::world_to_tracking(fitted.centre, world_q, tracking_p, tracking_q))
+			{
+				quad.QuadPoseCenter.Orientation = { tracking_q[0], tracking_q[1], tracking_q[2], tracking_q[3] };
+				quad.QuadPoseCenter.Position = { tracking_p[0], tracking_p[1], tracking_p[2] };
+				quad.QuadSize = { fitted.width, fitted.height };
+			}
+		}
 		if (shared)
 		{
 			calibrate(session, tracking, hand, finger);
