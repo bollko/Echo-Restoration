@@ -11,5 +11,7 @@ namespace tablet
 		float width, height;
 	};
 	bool panel_pose(PanelPose &pose);
+	void set_head(const float *world_position); // the player's head (camera thread): the panel faces it
+	void set_scale(float scale);                // panel size multiplier (EchoCam.ini [Panel] Scale)
 	bool start(unsigned char *exe, void (*log)(const char *format, ...)); // after MH_Initialize
 }

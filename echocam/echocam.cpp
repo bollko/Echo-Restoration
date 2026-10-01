@@ -278,6 +278,7 @@ namespace
 
 		alignas(16) float head[8];
 		std::memcpy(head, pose, sizeof(head));
+		tablet::set_head(head + 4);
 		alignas(16) float hands[2][8] = {};
 		const bool hands_ok = hand_pose(node, 0, hands[0]) && hand_pose(node, 1, hands[1]);
 		if (log_poses)

@@ -33,6 +33,8 @@ namespace
 	tablet::PanelPose s_pose{};
 	ULONGLONG s_pose_time = 0;
 	bool s_logged = false;
+	float s_head[3] = {}, s_scale = 1.3f;
+	bool s_have_head = false;
 
 	template <typename T>
 	bool read(uintptr_t address, T &value)
@@ -159,11 +161,28 @@ namespace
 		p.out[0] = p.right[1] * p.up[2] - p.right[2] * p.up[1];
 		p.out[1] = p.right[2] * p.up[0] - p.right[0] * p.up[2];
 		p.out[2] = p.right[0] * p.up[1] - p.right[1] * p.up[0];
+		// The tablet faces the player: if "out" points away from the head, the layout's y runs up rather than down
+		float head[3], panel_scale;
+		bool have_head;
+		{
+			const std::lock_guard<std::mutex> lock(s_mutex);
+			std::memcpy(head, s_head, sizeof(head));
+			have_head = s_have_head;
+			panel_scale = s_scale;
+		}
+		const float to_head[3] = { head[0] - origin[0], head[1] - origin[1], head[2] - origin[2] };
+		const bool flipped = have_head && to_head[0] * p.out[0] + to_head[1] * p.out[1] + to_head[2] * p.out[2] < 0;
+		if (flipped)
+			for (int c = 0; c < 3; ++c)
+			{
+				p.up[c] = -p.up[c];
+				p.out[c] = -p.out[c];
+			}
 
 		// The buttons span the tablet: its right edge is a little past the rightmost ones, its height their span
 		const float scale = std::sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]); // metres per layout metre (1 unless stretched)
 		const float edge_x = s.max_x + 0.012f, gap = 0.01f;
-		p.height = (s.max_y - s.min_y + 0.024f) * scale;
+		p.height = (s.max_y - s.min_y + 0.024f) * scale * panel_scale;
 		p.width = p.height * 3 / 4;
 		const float mid_y = (s.min_y + s.max_y) / 2;
 		for (int c = 0; c < 3; ++c)
@@ -176,8 +195,8 @@ namespace
 		if (!s_logged && s_log)
 		{
 			s_logged = true;
-			s_log("tablet: found from %d buttons: span x %.3f..%.3f y %.3f..%.3f m, panel %.3f x %.3f m", int(s.n), s.min_x, s.max_x, s.min_y, s.max_y,
-				p.width, p.height);
+			s_log("tablet: found from %d buttons: span x %.3f..%.3f y %.3f..%.3f m, panel %.3f x %.3f m%s", int(s.n), s.min_x, s.max_x, s.min_y,
+				s.max_y, p.width, p.height, flipped ? " (layout y runs up)" : "");
 		}
 	}
 
@@ -197,6 +216,19 @@ namespace tablet
 			return false;
 		pose = s_pose;
 		return true;
+	}
+
+	void set_head(const float *world_position)
+	{
+		const std::lock_guard<std::mutex> lock(s_mutex);
+		std::memcpy(s_head, world_position, sizeof(s_head));
+		s_have_head = true;
+	}
+
+	void set_scale(float scale)
+	{
+		const std::lock_guard<std::mutex> lock(s_mutex);
+		s_scale = (std::max)(0.5f, (std::min)(scale, 3.0f));
 	}
 
 	bool start(unsigned char *exe, void (*log)(const char *format, ...))
