@@ -14,6 +14,7 @@
  *   Rotation=0 -90 0      yaw pitch roll in degrees, applied in the controller's space
  *   Width=0.22            metres (the height follows the picture's aspect, 3:4 portrait)
  *   Scale=1.3             size of the panel beside the tablet, as a multiple of the tablet's height
+ *   Nudge=0.02 0.03       moves it along the tablet's edges: right, up (metres)
  *   TextureState=128      D3D12_RESOURCE_STATES the swap chain textures are in between frames (128 = PIXEL_SHADER_RESOURCE)
  * While the CAMERA tile is open, ArcadeHost shares the panel's picture (panel_ipc.h) and the panel shows by itself;
  * Show=1 shows a test pattern when nothing is shared.
@@ -164,6 +165,10 @@ namespace
 		float scale = 1.3f;
 		swscanf_s(text, L"%f", &scale);
 		tablet::set_scale(scale);
+		GetPrivateProfileStringW(L"Panel", L"Nudge", L"0.02 0.03", text, 96, ini);
+		float nudge[2] = { 0.02f, 0.03f };
+		swscanf_s(text, L"%f %f", &nudge[0], &nudge[1]);
+		tablet::set_nudge(nudge[0], nudge[1]);
 		s_texture_state = static_cast<D3D12_RESOURCE_STATES>(GetPrivateProfileIntW(L"Panel", L"TextureState", D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, ini));
 	}
 

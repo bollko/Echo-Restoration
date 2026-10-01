@@ -33,7 +33,7 @@ namespace
 	tablet::PanelPose s_pose{};
 	ULONGLONG s_pose_time = 0;
 	bool s_logged = false;
-	float s_head[3] = {}, s_scale = 1.3f;
+	float s_head[3] = {}, s_scale = 1.3f, s_nudge[2] = { 0.02f, 0.03f };
 	bool s_have_head = false;
 
 	template <typename T>
@@ -162,13 +162,15 @@ namespace
 		p.out[1] = p.right[2] * p.up[0] - p.right[0] * p.up[2];
 		p.out[2] = p.right[0] * p.up[1] - p.right[1] * p.up[0];
 		// The tablet faces the player: if "out" points away from the head, the layout's y runs up rather than down
-		float head[3], panel_scale;
+		float head[3], panel_scale, nudge[2];
 		bool have_head;
 		{
 			const std::lock_guard<std::mutex> lock(s_mutex);
 			std::memcpy(head, s_head, sizeof(head));
 			have_head = s_have_head;
 			panel_scale = s_scale;
+			nudge[0] = s_nudge[0];
+			nudge[1] = s_nudge[1];
 		}
 		const float to_head[3] = { head[0] - origin[0], head[1] - origin[1], head[2] - origin[2] };
 		const bool flipped = have_head && to_head[0] * p.out[0] + to_head[1] * p.out[1] + to_head[2] * p.out[2] < 0;
@@ -186,7 +188,7 @@ namespace
 		p.width = p.height * 3 / 4;
 		const float mid_y = (s.min_y + s.max_y) / 2;
 		for (int c = 0; c < 3; ++c)
-			p.centre[c] = origin[c] + right[c] * edge_x + down[c] * mid_y + p.right[c] * (gap + p.width / 2);
+			p.centre[c] = origin[c] + right[c] * edge_x + down[c] * mid_y + p.right[c] * (gap + p.width / 2 + nudge[0]) + p.up[c] * nudge[1];
 		if (!std::isfinite(p.centre[0]) || p.height <= 0.05f || p.height > 1.0f)
 			return;
 		const std::lock_guard<std::mutex> lock(s_mutex);
@@ -223,6 +225,13 @@ namespace tablet
 		const std::lock_guard<std::mutex> lock(s_mutex);
 		std::memcpy(s_head, world_position, sizeof(s_head));
 		s_have_head = true;
+	}
+
+	void set_nudge(float right, float up)
+	{
+		const std::lock_guard<std::mutex> lock(s_mutex);
+		s_nudge[0] = right;
+		s_nudge[1] = up;
 	}
 
 	void set_scale(float scale)
