@@ -36,6 +36,7 @@
 #include "spatial_ipc.h"
 #include <Windows.h>
 #include <d3d12.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -511,20 +512,50 @@ namespace
 				return;
 			s_spatial->magic = spatial_ipc::MAGIC;
 		}
-		tablet::PanelPose p;
-		const float identity[4] = { 0, 0, 0, 1 };
-		float tracking_p[3], tracking_q[4];
-		if (!tablet::panel_pose(p) || !bridge::world_to_tracking(p.screen, identity, tracking_p, tracking_q))
-			return;
 		const ovrTrackingState tracking = s_tracking(session, s_display_time(session, frame), 0);
 		ovrPosef head;
 		std::memcpy(&head, tracking.bytes, sizeof(head));
+		const float identity[4] = { 0, 0, 0, 1 };
+		float tracking_p[3], tracking_q[4];
+		LONG kind = spatial_ipc::Tablet;
+		// Docked on lobby posters (EchoArcade): the nearest of the posters showing the arcade, else the tablet's screen
+		float sources[spatial_ipc::MAX_SOURCES][3];
+		LONG count = 0, before = s_spatial->sourceSeq;
+		if (!(before & 1) && static_cast<LONGLONG>(GetTickCount64()) - s_spatial->sourceTime < 1000)
+		{
+			count = (std::min)(static_cast<LONG>(spatial_ipc::MAX_SOURCES), static_cast<LONG>(s_spatial->sourceCount));
+			std::memcpy(sources, const_cast<const float(*)[3]>(s_spatial->sources), sizeof(float) * 3 * (count > 0 ? count : 0));
+			if (s_spatial->sourceSeq != before)
+				count = 0;
+		}
+		float best = 1e9f;
+		for (LONG i = 0; i < count; ++i)
+		{
+			float candidate[3], q[4];
+			if (!bridge::world_to_tracking(sources[i], identity, candidate, q))
+				continue;
+			const float dx = candidate[0] - head.Position.x, dy = candidate[1] - head.Position.y, dz = candidate[2] - head.Position.z;
+			const float d = dx * dx + dy * dy + dz * dz;
+			if (d < best)
+			{
+				best = d;
+				std::memcpy(tracking_p, candidate, sizeof(tracking_p));
+				kind = spatial_ipc::Poster;
+			}
+		}
+		if (kind == spatial_ipc::Tablet)
+		{
+			tablet::PanelPose p;
+			if (!tablet::panel_pose(p) || !bridge::world_to_tracking(p.screen, identity, tracking_p, tracking_q))
+				return;
+		}
 		const ovrQuatf inverse{ -head.Orientation.x, -head.Orientation.y, -head.Orientation.z, head.Orientation.w };
 		const ovrVector3f local = rotate(inverse, { tracking_p[0] - head.Position.x, tracking_p[1] - head.Position.y, tracking_p[2] - head.Position.z });
 		InterlockedIncrement(&s_spatial->seq); // odd: being written
 		s_spatial->position[0] = local.x;
 		s_spatial->position[1] = local.y;
 		s_spatial->position[2] = local.z;
+		s_spatial->kind = kind;
 		s_spatial->time = static_cast<LONGLONG>(GetTickCount64());
 		InterlockedIncrement(&s_spatial->seq);
 	}
