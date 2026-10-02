@@ -186,7 +186,9 @@ namespace
 		const float edge_x = s.max_x + 0.012f, gap = 0.01f;
 		p.height = (s.max_y - s.min_y + 0.024f) * scale * panel_scale;
 		p.width = p.height * 3 / 4;
-		const float mid_y = (s.min_y + s.max_y) / 2;
+		const float mid_y = (s.min_y + s.max_y) / 2, mid_x = (s.min_x + s.max_x) / 2;
+		for (int c = 0; c < 3; ++c)
+			p.screen[c] = origin[c] + right[c] * mid_x + down[c] * mid_y;
 		for (int c = 0; c < 3; ++c)
 			p.centre[c] = origin[c] + right[c] * edge_x + down[c] * mid_y + p.right[c] * (gap + p.width / 2 + nudge[0]) + p.up[c] * nudge[1];
 		if (!std::isfinite(p.centre[0]) || p.height <= 0.05f || p.height > 1.0f)

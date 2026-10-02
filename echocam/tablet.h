@@ -8,6 +8,7 @@ namespace tablet
 	struct PanelPose
 	{
 		float centre[3], right[3], up[3], out[3];
+		float screen[3]; // the middle of the tablet's own screen (its touch buttons' span)
 		float width, height;
 	};
 	bool panel_pose(PanelPose &pose);

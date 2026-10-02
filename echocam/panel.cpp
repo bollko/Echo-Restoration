@@ -33,6 +33,7 @@
 #include "panel_ipc.h"
 #include "tablet.h"
 #include "bridge.h"
+#include "spatial_ipc.h"
 #include <Windows.h>
 #include <d3d12.h>
 #include <cmath>
@@ -492,6 +493,42 @@ namespace
 		s_shared->calibrateStep = s_calibrate_step;
 	}
 
+	// ---- the tablet's place relative to the head, for ArcadeHost's spatial sound (spatial_ipc.h) ----
+
+	spatial_ipc::Shared *s_spatial = nullptr;
+
+	void publish_tablet(ovrSession session, long long frame)
+	{
+		if (s_spatial == nullptr)
+		{
+			static bool tried = false;
+			if (tried)
+				return;
+			tried = true;
+			if (HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(spatial_ipc::Shared), spatial_ipc::NAME))
+				s_spatial = static_cast<spatial_ipc::Shared *>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(spatial_ipc::Shared)));
+			if (s_spatial == nullptr)
+				return;
+			s_spatial->magic = spatial_ipc::MAGIC;
+		}
+		tablet::PanelPose p;
+		const float identity[4] = { 0, 0, 0, 1 };
+		float tracking_p[3], tracking_q[4];
+		if (!tablet::panel_pose(p) || !bridge::world_to_tracking(p.screen, identity, tracking_p, tracking_q))
+			return;
+		const ovrTrackingState tracking = s_tracking(session, s_display_time(session, frame), 0);
+		ovrPosef head;
+		std::memcpy(&head, tracking.bytes, sizeof(head));
+		const ovrQuatf inverse{ -head.Orientation.x, -head.Orientation.y, -head.Orientation.z, head.Orientation.w };
+		const ovrVector3f local = rotate(inverse, { tracking_p[0] - head.Position.x, tracking_p[1] - head.Position.y, tracking_p[2] - head.Position.z });
+		InterlockedIncrement(&s_spatial->seq); // odd: being written
+		s_spatial->position[0] = local.x;
+		s_spatial->position[1] = local.y;
+		s_spatial->position[2] = local.z;
+		s_spatial->time = static_cast<LONGLONG>(GetTickCount64());
+		InterlockedIncrement(&s_spatial->seq);
+	}
+
 	// ---- frame hook ----
 
 	ovrResult submit(end_frame_fn original, ovrSession session, long long frame, const void *view_scale, const ovrLayerHeader *const *layers, unsigned count)
@@ -516,6 +553,8 @@ namespace
 			queue = s_queue;
 		}
 		open_shared();
+		if (s_tracking && s_display_time && layers != nullptr)
+			publish_tablet(session, frame);
 		const bool shared = s_shared != nullptr && s_shared->magic == panel_ipc::MAGIC && s_shared->visible != 0;
 		if ((!show && !shared) || s_failed || queue == nullptr || layers == nullptr || count >= 16)
 			return original(session, frame, view_scale, layers, count);
